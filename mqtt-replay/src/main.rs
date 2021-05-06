@@ -1,4 +1,5 @@
 use log::*;
+use regex::RegexSet;
 use rumqttc::{qos, Client, MqttOptions};
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
@@ -49,6 +50,10 @@ struct Opt {
     /// Skip for certain amount of time
     #[structopt(long, env = "SKIP", default_value = "0.0")]
     skip: f64,
+
+    /// Topic rejection regex, can be multiple or comma-separated: REGEX1,REGEX2,...
+    #[structopt(long, use_delimiter = true, env = "TOPIC_REJECTION_REGEX")]
+    filter_topic: Vec<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -74,6 +79,16 @@ fn main() -> anyhow::Result<()> {
         "Playback speed multiplier needs to be larger than 0"
     );
 
+    println!("filter_topic: {:#?}", opt.filter_topic);
+
+    // let re = Regex::new(r"tag/[[:xdigit:]]+/position").unwrap();
+    // println!("is match: {}", re.is_match("/wispr/tag/f133d7df5ac4efa2/position"));
+    let filter_topic = if !opt.filter_topic.is_empty() {
+        Some(RegexSet::new(&opt.filter_topic).unwrap())
+    } else {
+        None
+    };
+
     let mut mqtt_options = MqttOptions::new("replay-sub1", &server, port);
     mqtt_options.set_keep_alive(5);
     let (mut mqtt_client, mut connection) = Client::new(mqtt_options, 10);
@@ -85,6 +100,11 @@ fn main() -> anyhow::Result<()> {
         port,
         speed,
     );
+
+    if !opt.filter_topic.is_empty() {
+        let filters = opt.filter_topic.join(", ");
+        info!("The following topic filters are active: {}", filters);
+    }
 
     let f = BufReader::new(File::open(&input)?);
     let start_time_local = SystemTime::now();
@@ -116,7 +136,13 @@ fn main() -> anyhow::Result<()> {
                 }
             };
 
-            if seek_done {
+            // Check for filtered message
+            let filter_message = filter_topic
+                .as_ref()
+                .map(|re| re.is_match(&msg.topic))
+                .unwrap_or(false);
+
+            if seek_done && !filter_message {
                 let qos = match qos(msg.qos) {
                     Ok(q) => q,
                     Err(e) => {
@@ -173,7 +199,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        info!("Shutting down...");
+        info!("Dataset completed, shutting down...");
 
         thread_keep_running.store(false, Ordering::SeqCst);
     });
