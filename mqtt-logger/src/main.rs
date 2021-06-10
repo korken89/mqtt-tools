@@ -1,7 +1,9 @@
+use indicatif::{ProgressBar, ProgressStyle};
 use log::*;
 use rumqttc::{Client, Event, Incoming, MqttOptions, QoS};
 use serde::Serialize;
 use simple_logger::SimpleLogger;
+use std::borrow::Cow;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -26,12 +28,16 @@ struct MqttMessage {
 #[structopt(name = "mqtt-logger", about = "A logger of an entire MQTT stream")]
 struct Opt {
     /// The verbosity of output from this program, the higher the more output one can expect
-    #[structopt(short, long, env = "VERBOSITY", default_value = "2")]
+    #[structopt(short, long, env = "VERBOSITY", default_value = "0")]
     verbosity: u32,
 
     /// Output log file
     #[structopt(env = "OUTPUT", parse(from_os_str))]
     output: PathBuf,
+
+    /// ZSTD compression level
+    #[structopt(short, long, env = "COMPRESSION_LEVEL", default_value = "9")]
+    compression_level: i32,
 
     /// Server address
     #[structopt(short, long, env = "SERVER", default_value = "localhost")]
@@ -45,9 +51,12 @@ struct Opt {
 fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
 
-    let output = opt.output;
+    let mut output = opt.output;
     let server = opt.server;
     let port = opt.port;
+    let compression_level = opt.compression_level;
+
+    output.set_extension("json.zst");
 
     match opt.verbosity {
         0 => SimpleLogger::new().with_level(log::LevelFilter::Off),
@@ -68,13 +77,14 @@ fn main() -> anyhow::Result<()> {
     })
     .expect("Error setting Ctrl-C handler");
 
-    let mut log_file = BufWriter::with_capacity(
+    let log_file = BufWriter::with_capacity(
         16 * 1024 * 1024, // 16 MB cache
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&output)?,
     );
+    let mut log_file = zstd::Encoder::new(log_file, compression_level)?.auto_finish();
 
     let mut mqtt_options = MqttOptions::new("mqtt-logger-sub1", &server, port);
     mqtt_options.set_keep_alive(5);
@@ -82,15 +92,31 @@ fn main() -> anyhow::Result<()> {
 
     mqtt_client.subscribe("#", QoS::AtLeastOnce).unwrap();
 
-    info!(
+    println!(
         "Starting logging into '{}' on address '{}:{}'...",
         output.to_str().unwrap(),
         server,
         port
     );
 
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(80);
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .tick_strings(&[
+                "[    ]", "[=   ]", "[==  ]", "[=== ]", "[ ===]", "[  ==]", "[   =]", "[    ]",
+                "[   =]", "[  ==]", "[ ===]", "[====]", "[=== ]", "[==  ]", "[=   ]",
+            ])
+            .template("{spinner} {msg}"),
+    );
+    pb.set_message("Logging... No messages recorded yet.");
+
+    let mut count: u64 = 0;
+    let mut bytes_written = 0.;
+
     for notification in notifications.iter() {
         if !running.load(Ordering::SeqCst) {
+            pb.finish();
             break;
         }
 
@@ -110,6 +136,14 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 if let Ok(serialized) = serde_json::to_string(&msg) {
+                    count += 1;
+                    bytes_written += serialized.len() as f64 + 2.; // 2 = newline
+
+                    pb.set_message(Cow::Owned(format!(
+                        "Logging... {} messages recorded, data size: {:.2} MB.",
+                        count,
+                        bytes_written / 1024. / 1024.,
+                    )));
                     writeln!(log_file, "{}", serialized).unwrap();
                 }
             }

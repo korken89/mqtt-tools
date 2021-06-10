@@ -1,6 +1,6 @@
 use log::*;
 use regex::RegexSet;
-use rumqttc::{qos, Client, MqttOptions};
+use rumqttc::{Client, MqttOptions};
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
 use std::fs::File;
@@ -35,6 +35,10 @@ struct Opt {
     #[structopt(env = "INPUT", parse(from_os_str))]
     input: PathBuf,
 
+    /// Secondary input log file, needs to have slower data than the main file
+    #[structopt(short, long, env = "SECONDARY_INPUT", parse(from_os_str))]
+    secondary_input: Option<PathBuf>,
+
     /// Server address
     #[structopt(short, long, env = "SERVER", default_value = "localhost")]
     server: String,
@@ -60,6 +64,7 @@ fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
 
     let input = opt.input;
+    let secondary_input = opt.secondary_input;
     let server = opt.server;
     let port = opt.port;
     let speed = opt.speed;
@@ -114,8 +119,24 @@ fn main() -> anyhow::Result<()> {
 
     let keep_running = Arc::new(AtomicBool::new(true));
     let thread_keep_running = keep_running.clone();
+    let mut secondary_input = if let Some(secondary_input) = secondary_input {
+        Some(BufReader::new(File::open(&secondary_input)?).lines())
+    } else {
+        None
+    };
 
     thread::spawn(move || {
+        let mut wifi_msg = if let Some(lines) = &mut secondary_input {
+            if let Some(Ok(v)) = lines.next() {
+                let msg: Option<MqttMessage> = serde_json::from_str(&v).ok();
+                msg
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         for line in f.lines() {
             let line = if let Ok(line) = line {
                 line
@@ -143,7 +164,8 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or(false);
 
             if seek_done && !filter_message {
-                let qos = match qos(msg.qos) {
+                // Widefind messages
+                let qos = match rumqttc::qos(msg.qos) {
                     Ok(q) => q,
                     Err(e) => {
                         error!("Corrupted dataset: QOS invalid '{}'", e);
@@ -162,6 +184,51 @@ fn main() -> anyhow::Result<()> {
                 mqtt_client
                     .publish(msg.topic, qos, msg.retain, b64)
                     .unwrap();
+
+                // LKAB messages
+                let mut new_wifi_message = false;
+                if let Some(wifi_msg) = &wifi_msg {
+                    if wifi_msg.time <= msg.time {
+                        // println!(
+                        //     "WiFi time: {:.2}\nUWB time:  {:.2}",
+                        //     wifi_msg.time, msg.time
+                        // );
+                        let qos = match rumqttc::qos(wifi_msg.qos) {
+                            Ok(q) => q,
+                            Err(e) => {
+                                error!("Corrupted dataset: QOS invalid '{}'", e);
+                                continue;
+                            }
+                        };
+
+                        let b64 = match base64::decode(&wifi_msg.msg_b64) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                error!("Corrupted dataset: data is not base64 encoded '{}'", e);
+                                continue;
+                            }
+                        };
+
+                        mqtt_client
+                            .publish(&wifi_msg.topic, qos, wifi_msg.retain, b64)
+                            .unwrap();
+
+                        new_wifi_message = true;
+                    }
+                }
+
+                if new_wifi_message {
+                    wifi_msg = if let Some(lines) = &mut secondary_input {
+                        if let Some(Ok(v)) = lines.next() {
+                            let msg: Option<MqttMessage> = serde_json::from_str(&v).ok();
+                            msg
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                }
             }
 
             if first_message {

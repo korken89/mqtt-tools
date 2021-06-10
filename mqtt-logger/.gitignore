@@ -1,2 +1,5 @@
 /target
+*.json
+*.txt
+*.zst
 Cargo.lock
