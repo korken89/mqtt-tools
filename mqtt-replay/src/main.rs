@@ -36,7 +36,7 @@ struct Opt {
     input: PathBuf,
 
     /// Secondary input log file, needs to have slower data than the main file
-    #[structopt(short, long, env = "SECONDARY_INPUT", parse(from_os_str))]
+    #[structopt(long, env = "SECONDARY_INPUT", parse(from_os_str))]
     secondary_input: Option<PathBuf>,
 
     /// Server address

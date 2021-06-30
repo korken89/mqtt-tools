@@ -1,6 +1,9 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use log::*;
-use rumqttc::{Client, Event, Incoming, MqttOptions, QoS};
+use rumqttc::{
+    Client, ClientConfig, ConnectionError, Event, Incoming, MqttOptions, Outgoing, QoS,
+    TlsConfiguration, Transport,
+};
 use serde::Serialize;
 use simple_logger::SimpleLogger;
 use std::borrow::Cow;
@@ -44,8 +47,16 @@ struct Opt {
     server: String,
 
     /// Server port
-    #[structopt(short, long, env = "PORT", default_value = "1883")]
-    port: u16,
+    #[structopt(short, long, env = "PORT")]
+    port: Option<u16>,
+
+    /// TLS enable
+    #[structopt(long, env = "TLS")]
+    tls: bool,
+
+    /// Path to custom CA file
+    #[structopt(long, env = "CUSTOM_CA")]
+    custom_ca: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -53,7 +64,11 @@ fn main() -> anyhow::Result<()> {
 
     let mut output = opt.output;
     let server = opt.server;
-    let port = opt.port;
+    let port = opt.port.unwrap_or(if opt.tls || opt.custom_ca.is_some() {
+        8883
+    } else {
+        1883
+    });
     let compression_level = opt.compression_level;
 
     output.set_extension("json.zst");
@@ -86,18 +101,86 @@ fn main() -> anyhow::Result<()> {
     );
     let mut log_file = zstd::Encoder::new(log_file, compression_level)?.auto_finish();
 
+    // -------------------------- MQTT Start ---------------------------
+
     let mut mqtt_options = MqttOptions::new("mqtt-logger-sub1", &server, port);
+
+    // Check for custom CA file
+    let custom_ca = if let Some(custom_ca_path) = &opt.custom_ca {
+        use std::io::prelude::*;
+
+        let ca_str = custom_ca_path.to_str();
+
+        if !(ca_str == Some("null") || ca_str == Some("None") || ca_str == Some("none")) {
+            let mut vec = Vec::new();
+
+            fs::File::open(custom_ca_path)
+                .expect("Could not open CA file")
+                .read_to_end(&mut vec)
+                .expect("Could not read specified CA file");
+
+            Some(vec)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Encrypted MQTT?
+    if opt.tls || custom_ca.is_some() {
+        let transport = if let Some(custom_ca) = &custom_ca {
+            Transport::Tls(TlsConfiguration::Simple {
+                ca: custom_ca.clone(),
+                alpn: None,
+                client_auth: None,
+            })
+        } else {
+            let mut client_config = ClientConfig::new();
+            // Use rustls-native-certs to load root certificates from the operating system.
+            client_config.root_store = rustls_native_certs::load_native_certs()
+                .expect("Failed to load platform certificates.");
+
+            Transport::tls_with_config(client_config.into())
+        };
+
+        mqtt_options.set_transport(transport);
+    }
+
     mqtt_options.set_keep_alive(5);
     let (mut mqtt_client, mut notifications) = Client::new(mqtt_options, 10);
 
     mqtt_client.subscribe("#", QoS::AtLeastOnce).unwrap();
 
-    println!(
-        "Starting logging into '{}' on address '{}:{}'...",
-        output.to_str().unwrap(),
-        server,
-        port
-    );
+    // -------------------------- MQTT END ---------------------------
+
+    if opt.tls || custom_ca.is_some() {
+        let certs: String = if custom_ca.is_some() {
+            format!(
+                "custom CA loaded from '{}'",
+                opt.custom_ca.unwrap().to_str().unwrap()
+            )
+        } else {
+            "using native certs".into()
+        };
+
+        println!(
+            "Starting logging with ZSTD compression (level {}) into '{}' on address '{}:{}' using TLS ({})",
+            compression_level,
+            output.to_str().unwrap(),
+            server,
+            port,
+            certs,
+        );
+    } else {
+        println!(
+            "Starting logging with ZSTD compression (level {}) into '{}' on address '{}:{}'...",
+            compression_level,
+            output.to_str().unwrap(),
+            server,
+            port
+        );
+    }
 
     let pb = ProgressBar::new_spinner();
     pb.enable_steady_tick(80);
@@ -113,14 +196,13 @@ fn main() -> anyhow::Result<()> {
 
     let mut count: u64 = 0;
     let mut bytes_written = 0.;
+    let mut connected = true;
 
     for notification in notifications.iter() {
         if !running.load(Ordering::SeqCst) {
             pb.finish();
             break;
         }
-
-        trace!("{:?}", notification);
 
         match notification {
             Ok(Event::Incoming(Incoming::Publish(msg))) => {
@@ -140,7 +222,7 @@ fn main() -> anyhow::Result<()> {
                     bytes_written += serialized.len() as f64 + 2.; // 2 = newline
 
                     pb.set_message(Cow::Owned(format!(
-                        "Logging... {} messages recorded, data size: {:.2} MB.",
+                        "Logging... {} messages recorded, uncompressed data size: {:.2} MB.",
                         count,
                         bytes_written / 1024. / 1024.,
                     )));
@@ -151,7 +233,28 @@ fn main() -> anyhow::Result<()> {
                 debug!("Disconnected, trying to reconnect...");
                 mqtt_client.subscribe("#", QoS::AtLeastOnce).unwrap();
             }
-            _ => (),
+            Ok(Event::Outgoing(Outgoing::PingReq)) => {
+                if !connected {
+                    debug!("Trying to resubscribe...");
+                    mqtt_client.subscribe("#", QoS::AtLeastOnce).unwrap();
+                    connected = true;
+                }
+            }
+            Ok(val) => trace!("Unhandled Ok(...) notification: {:?}", val),
+            Err(val) => match val {
+                ConnectionError::MqttState(e) => {
+                    debug!("MQTT error, will try to reconnect when possible: {:?}", e);
+                    connected = false;
+                }
+                ConnectionError::Network(e) => {
+                    debug!(
+                        "Network error, will try to reconnect when possible: {:?}",
+                        e
+                    );
+                    connected = false;
+                }
+                _ => trace!("Unhandled Err(...) notification: {:?}", val),
+            },
         }
     }
 
