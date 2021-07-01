@@ -103,7 +103,11 @@ fn main() -> anyhow::Result<()> {
 
     // -------------------------- MQTT Start ---------------------------
 
-    let mut mqtt_options = MqttOptions::new("mqtt-logger-sub1", &server, port);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let mut mqtt_options = MqttOptions::new(&format!("mqtt-logger-sub{}", nanos), &server, port);
 
     // Check for custom CA file
     let custom_ca = if let Some(custom_ca_path) = &opt.custom_ca {
