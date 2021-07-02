@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::*;
 use rumqttc::{
@@ -12,6 +13,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::SystemTime;
 use structopt::StructOpt;
 
@@ -61,6 +63,10 @@ struct Opt {
     /// An optional duration for how long to log, e.g. 100s, 12h, 1year, etc.
     #[structopt(long, env = "DURATION")]
     duration: Option<String>,
+
+    /// Topic to subscribe to. Supports multiple.
+    #[structopt(long, env = "TOPIC", default_value = "#")]
+    topic: Vec<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -75,7 +81,10 @@ fn main() -> anyhow::Result<()> {
     });
     let compression_level = opt.compression_level;
     let duration = if let Some(s) = &opt.duration {
-        Some(parse_duration::parse(&s).unwrap())
+        Some(parse_duration::parse(&s).expect(&format!(
+            "Unable to parse the --duration argument: '{}'",
+            &s
+        )))
     } else {
         None
     };
@@ -114,7 +123,7 @@ fn main() -> anyhow::Result<()> {
 
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(Duration::new(0, 1))
         .subsec_nanos();
     let mut mqtt_options = MqttOptions::new(&format!("mqtt-logger-sub{}", nanos), &server, port);
 
@@ -163,7 +172,13 @@ fn main() -> anyhow::Result<()> {
     mqtt_options.set_keep_alive(5);
     let (mut mqtt_client, mut notifications) = Client::new(mqtt_options, 10);
 
-    mqtt_client.subscribe("#", QoS::AtLeastOnce).unwrap();
+    if opt.topic.is_empty() {
+        return Err(anyhow!("No topics supplied"));
+    }
+
+    for topic in &opt.topic {
+        mqtt_client.subscribe(topic, QoS::AtLeastOnce)?;
+    }
 
     // -------------------------- MQTT END ---------------------------
     println!(
@@ -173,6 +188,10 @@ fn main() -> anyhow::Result<()> {
         server,
         port
     );
+
+    for topic in &opt.topic {
+        println!("    - Subscribing to topic '{}'", topic);
+    }
 
     if opt.tls || custom_ca.is_some() {
         let certs: String = if custom_ca.is_some() {
@@ -215,7 +234,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         if let Some(dur) = duration {
-            if SystemTime::now().duration_since(time_start).unwrap() > dur {
+            if SystemTime::now().duration_since(time_start)? > dur {
                 running.store(false, Ordering::SeqCst);
             }
         }
@@ -224,8 +243,7 @@ fn main() -> anyhow::Result<()> {
             Ok(Event::Incoming(Incoming::Publish(msg))) => {
                 let msg = MqttMessage {
                     time: SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap()
+                        .duration_since(SystemTime::UNIX_EPOCH)?
                         .as_secs_f64(),
                     qos: msg.qos as u8,
                     retain: msg.retain,
@@ -242,17 +260,21 @@ fn main() -> anyhow::Result<()> {
                         count,
                         bytes_written / 1024. / 1024.,
                     )));
-                    writeln!(log_file, "{}", serialized).unwrap();
+                    writeln!(log_file, "{}", serialized)?
                 }
             }
             Ok(Event::Incoming(Incoming::Disconnect)) => {
                 debug!("Disconnected, trying to reconnect...");
-                mqtt_client.subscribe("#", QoS::AtLeastOnce).unwrap();
+                connected = false;
             }
             Ok(Event::Outgoing(Outgoing::PingReq)) => {
                 if !connected {
                     debug!("Trying to resubscribe...");
-                    mqtt_client.subscribe("#", QoS::AtLeastOnce).unwrap();
+
+                    for topic in &opt.topic {
+                        mqtt_client.subscribe(topic, QoS::AtLeastOnce)?;
+                    }
+
                     connected = true;
                 }
             }
@@ -269,7 +291,10 @@ fn main() -> anyhow::Result<()> {
                     );
                     connected = false;
                 }
-                _ => trace!("Unhandled Err(...) notification: {:?}", val),
+                _ => {
+                    trace!("Unhandled Err(...) notification: {:?}", val);
+                    connected = false;
+                }
             },
         }
     }
