@@ -57,6 +57,10 @@ struct Opt {
     /// Path to custom CA file
     #[structopt(long, env = "CUSTOM_CA")]
     custom_ca: Option<PathBuf>,
+
+    /// An optional duration for how long to log, e.g. 100s, 12h, 1year, etc.
+    #[structopt(long, env = "DURATION")]
+    duration: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -70,6 +74,11 @@ fn main() -> anyhow::Result<()> {
         1883
     });
     let compression_level = opt.compression_level;
+    let duration = if let Some(s) = &opt.duration {
+        Some(parse_duration::parse(&s).unwrap())
+    } else {
+        None
+    };
 
     output.set_extension("json.zst");
 
@@ -157,6 +166,13 @@ fn main() -> anyhow::Result<()> {
     mqtt_client.subscribe("#", QoS::AtLeastOnce).unwrap();
 
     // -------------------------- MQTT END ---------------------------
+    println!(
+        "Starting logging with ZSTD compression (level {}) into '{}' on address '{}:{}'",
+        compression_level,
+        output.to_str().unwrap(),
+        server,
+        port
+    );
 
     if opt.tls || custom_ca.is_some() {
         let certs: String = if custom_ca.is_some() {
@@ -168,22 +184,11 @@ fn main() -> anyhow::Result<()> {
             "using native certs".into()
         };
 
-        println!(
-            "Starting logging with ZSTD compression (level {}) into '{}' on address '{}:{}' using TLS ({})",
-            compression_level,
-            output.to_str().unwrap(),
-            server,
-            port,
-            certs,
-        );
-    } else {
-        println!(
-            "Starting logging with ZSTD compression (level {}) into '{}' on address '{}:{}'...",
-            compression_level,
-            output.to_str().unwrap(),
-            server,
-            port
-        );
+        println!("    - using TLS ({})", certs,);
+    }
+
+    if let Some(dur) = &duration {
+        println!("    - Stopping after {:?} ({})", dur, opt.duration.unwrap());
     }
 
     let pb = ProgressBar::new_spinner();
@@ -201,11 +206,18 @@ fn main() -> anyhow::Result<()> {
     let mut count: u64 = 0;
     let mut bytes_written = 0.;
     let mut connected = true;
+    let time_start = SystemTime::now();
 
     for notification in notifications.iter() {
         if !running.load(Ordering::SeqCst) {
             pb.finish();
             break;
+        }
+
+        if let Some(dur) = duration {
+            if SystemTime::now().duration_since(time_start).unwrap() > dur {
+                running.store(false, Ordering::SeqCst);
+            }
         }
 
         match notification {
