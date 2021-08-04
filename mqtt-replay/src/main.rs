@@ -1,8 +1,9 @@
 use log::*;
 use regex::RegexSet;
-use rumqttc::{Client, MqttOptions};
+use rumqttc::{Client, ClientConfig, MqttOptions, TlsConfiguration, Transport};
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{prelude::*, BufReader};
 use std::path::PathBuf;
@@ -35,17 +36,13 @@ struct Opt {
     #[structopt(env = "INPUT", parse(from_os_str))]
     input: PathBuf,
 
-    /// Secondary input log file, needs to have slower data than the main file
-    #[structopt(long, env = "SECONDARY_INPUT", parse(from_os_str))]
-    secondary_input: Option<PathBuf>,
-
     /// Server address
     #[structopt(short, long, env = "SERVER", default_value = "localhost")]
     server: String,
 
     /// Server port
-    #[structopt(short, long, env = "PORT", default_value = "1883")]
-    port: u16,
+    #[structopt(short, long, env = "PORT")]
+    port: Option<u16>,
 
     /// Replay speed multiplier
     #[structopt(long, env = "SPEED", default_value = "1.0")]
@@ -58,17 +55,35 @@ struct Opt {
     /// Topic rejection regex, can be multiple or comma-separated: REGEX1,REGEX2,...
     #[structopt(long, use_delimiter = true, env = "TOPIC_REJECTION_REGEX")]
     filter_topic: Vec<String>,
+
+    /// TLS enable
+    #[structopt(long, env = "TLS")]
+    tls: bool,
+
+    /// Path to custom CA file
+    #[structopt(long, env = "CUSTOM_CA")]
+    custom_ca: Option<PathBuf>,
+
+    /// The file is a ZSTD compressed log file
+    #[structopt(long, env = "ZSTD")]
+    zstd: Option<bool>,
 }
 
 fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
 
     let input = opt.input;
-    let secondary_input = opt.secondary_input;
     let server = opt.server;
-    let port = opt.port;
+    let port = opt.port.unwrap_or(if opt.tls || opt.custom_ca.is_some() {
+        8883
+    } else {
+        1883
+    });
     let speed = opt.speed;
     let skip_to_time = opt.skip;
+    let zstd = opt
+        .zstd
+        .unwrap_or(input.extension() == Some(OsStr::new("zst")));
 
     match opt.verbosity {
         0 => SimpleLogger::new().with_level(log::LevelFilter::Off),
@@ -84,7 +99,7 @@ fn main() -> anyhow::Result<()> {
         "Playback speed multiplier needs to be larger than 0"
     );
 
-    println!("filter_topic: {:#?}", opt.filter_topic);
+    // println!("filter_topic: {:#?}", opt.filter_topic);
 
     // let re = Regex::new(r"tag/[[:xdigit:]]+/position").unwrap();
     // println!("is match: {}", re.is_match("/wispr/tag/f133d7df5ac4efa2/position"));
@@ -94,7 +109,54 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    let mut mqtt_options = MqttOptions::new("replay-sub1", &server, port);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or(Duration::new(0, 1))
+        .subsec_nanos();
+    let mut mqtt_options = MqttOptions::new(&format!("mqtt-logger-sub{}", nanos), &server, port);
+
+    // Check for custom CA file
+    let custom_ca = if let Some(custom_ca_path) = &opt.custom_ca {
+        use std::io::prelude::*;
+
+        let ca_str = custom_ca_path.to_str();
+
+        if !(ca_str == Some("null") || ca_str == Some("None") || ca_str == Some("none")) {
+            let mut vec = Vec::new();
+
+            File::open(custom_ca_path)
+                .expect("Could not open CA file")
+                .read_to_end(&mut vec)
+                .expect("Could not read specified CA file");
+
+            Some(vec)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Encrypted MQTT?
+    if opt.tls || custom_ca.is_some() {
+        let transport = if let Some(custom_ca) = &custom_ca {
+            Transport::Tls(TlsConfiguration::Simple {
+                ca: custom_ca.clone(),
+                alpn: None,
+                client_auth: None,
+            })
+        } else {
+            let mut client_config = ClientConfig::new();
+            // Use rustls-native-certs to load root certificates from the operating system.
+            client_config.root_store = rustls_native_certs::load_native_certs()
+                .expect("Failed to load platform certificates.");
+
+            Transport::tls_with_config(client_config.into())
+        };
+
+        mqtt_options.set_transport(transport);
+    }
+
     mqtt_options.set_keep_alive(5);
     let (mut mqtt_client, mut connection) = Client::new(mqtt_options, 10);
 
@@ -111,33 +173,21 @@ fn main() -> anyhow::Result<()> {
         info!("The following topic filters are active: {}", filters);
     }
 
-    let f = BufReader::new(File::open(&input)?);
     let start_time_local = SystemTime::now();
     let mut start_time_log: f64 = 0.0;
     let mut first_message = true;
     let mut seek_done = skip_to_time == 0.;
 
+    let mut f = BufReader::new(File::open(&input)?);
+    let mut zf = zstd::Decoder::new(BufReader::new(File::open(&input)?))?;
     let keep_running = Arc::new(AtomicBool::new(true));
     let thread_keep_running = keep_running.clone();
-    let mut secondary_input = if let Some(secondary_input) = secondary_input {
-        Some(BufReader::new(File::open(&secondary_input)?).lines())
-    } else {
-        None
-    };
 
     thread::spawn(move || {
-        let mut wifi_msg = if let Some(lines) = &mut secondary_input {
-            if let Some(Ok(v)) = lines.next() {
-                let msg: Option<MqttMessage> = serde_json::from_str(&v).ok();
-                msg
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let log_file: &mut dyn std::io::Read = if zstd { &mut zf } else { &mut f };
+        let log_file = BufReader::new(log_file);
 
-        for line in f.lines() {
+        for line in log_file.lines() {
             let line = if let Ok(line) = line {
                 line
             } else {
@@ -184,51 +234,6 @@ fn main() -> anyhow::Result<()> {
                 mqtt_client
                     .publish(msg.topic, qos, msg.retain, b64)
                     .unwrap();
-
-                // LKAB messages
-                let mut new_wifi_message = false;
-                if let Some(wifi_msg) = &wifi_msg {
-                    if wifi_msg.time <= msg.time {
-                        // println!(
-                        //     "WiFi time: {:.2}\nUWB time:  {:.2}",
-                        //     wifi_msg.time, msg.time
-                        // );
-                        let qos = match rumqttc::qos(wifi_msg.qos) {
-                            Ok(q) => q,
-                            Err(e) => {
-                                error!("Corrupted dataset: QOS invalid '{}'", e);
-                                continue;
-                            }
-                        };
-
-                        let b64 = match base64::decode(&wifi_msg.msg_b64) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                error!("Corrupted dataset: data is not base64 encoded '{}'", e);
-                                continue;
-                            }
-                        };
-
-                        mqtt_client
-                            .publish(&wifi_msg.topic, qos, wifi_msg.retain, b64)
-                            .unwrap();
-
-                        new_wifi_message = true;
-                    }
-                }
-
-                if new_wifi_message {
-                    wifi_msg = if let Some(lines) = &mut secondary_input {
-                        if let Some(Ok(v)) = lines.next() {
-                            let msg: Option<MqttMessage> = serde_json::from_str(&v).ok();
-                            msg
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                }
             }
 
             if first_message {
