@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use chrono::{DateTime, SecondsFormat, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::*;
 use rumqttc::{
@@ -61,8 +62,12 @@ struct Opt {
     custom_ca: Option<PathBuf>,
 
     /// An optional duration for how long to log, e.g. 100s, 12h, 1year, etc.
-    #[structopt(long, env = "DURATION")]
+    #[structopt(long, required_if("forever", "true"), env = "DURATION")]
     duration: Option<String>,
+
+    /// If this is set it will log and save a new file with the period set by duration.
+    #[structopt(long, env = "FOREVER")]
+    forever: bool,
 
     /// Topic to subscribe to. Supports multiple.
     #[structopt(long, env = "TOPIC", default_value = "#")]
@@ -72,7 +77,6 @@ struct Opt {
 fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
 
-    let mut output = opt.output;
     let server = opt.server;
     let port = opt.port.unwrap_or(if opt.tls || opt.custom_ca.is_some() {
         8883
@@ -87,6 +91,36 @@ fn main() -> anyhow::Result<()> {
         )))
     } else {
         None
+    };
+    let forever = opt.forever;
+    let mut output = if !forever {
+        opt.output.clone()
+    } else {
+        if duration.unwrap() < Duration::from_secs(1) {
+            return Err(anyhow!(
+                "The duration needs to be more than 1 second when using --forever"
+            ));
+        }
+
+        let mut output = opt.output.clone();
+
+        let utc: DateTime<Utc> = Utc::now();
+        let filename = output
+            .file_stem()
+            .expect("Empty filename?")
+            .to_str()
+            .expect("Non-unicode path?");
+        let now_time = format!(
+            "{}-{}",
+            filename,
+            utc.to_rfc3339_opts(SecondsFormat::Secs, false)
+        );
+
+        output.set_file_name(now_time);
+
+        println!("output: {:?}", output);
+
+        output
     };
 
     output.set_extension("json.zst");
@@ -207,7 +241,15 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(dur) = &duration {
-        println!("    - Stopping after {:?} ({})", dur, opt.duration.unwrap());
+        if forever {
+            println!(
+                "    - Running forever, saving logfiles every {:?} ({})",
+                dur,
+                opt.duration.unwrap()
+            );
+        } else {
+            println!("    - Stopping after {:?} ({})", dur, opt.duration.unwrap());
+        }
     }
 
     let pb = ProgressBar::new_spinner();
@@ -226,6 +268,7 @@ fn main() -> anyhow::Result<()> {
     let mut bytes_written = 0.;
     let mut connected = true;
     let time_start = SystemTime::now();
+    let mut duration_check = time_start;
 
     for notification in notifications.iter() {
         if !running.load(Ordering::SeqCst) {
@@ -234,8 +277,37 @@ fn main() -> anyhow::Result<()> {
         }
 
         if let Some(dur) = duration {
-            if SystemTime::now().duration_since(time_start)? > dur {
-                running.store(false, Ordering::SeqCst);
+            if SystemTime::now().duration_since(duration_check)? > dur {
+                if forever {
+                    duration_check = SystemTime::now();
+                    let mut output = opt.output.clone();
+
+                    let utc: DateTime<Utc> = Utc::now();
+                    let filename = output
+                        .file_stem()
+                        .expect("Empty filename?")
+                        .to_str()
+                        .expect("Non-unicode path?");
+                    let now_time = format!(
+                        "{}-{}",
+                        filename,
+                        utc.to_rfc3339_opts(SecondsFormat::Secs, false)
+                    );
+
+                    output.set_file_name(now_time);
+                    output.set_extension("json.zst");
+
+                    let lf = BufWriter::with_capacity(
+                        16 * 1024 * 1024, // 16 MB cache
+                        fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&output)?,
+                    );
+                    log_file = zstd::Encoder::new(lf, compression_level)?.auto_finish();
+                } else {
+                    running.store(false, Ordering::SeqCst);
+                }
             }
         }
 
