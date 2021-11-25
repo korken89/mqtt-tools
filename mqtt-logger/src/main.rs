@@ -145,7 +145,7 @@ fn main() -> anyhow::Result<()> {
     .expect("Error setting Ctrl-C handler");
 
     let log_file = BufWriter::with_capacity(
-        16 * 1024 * 1024, // 16 MB cache
+        128 * 1024, // 128 kB cache
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -298,7 +298,7 @@ fn main() -> anyhow::Result<()> {
                     output.set_extension("json.zst");
 
                     let lf = BufWriter::with_capacity(
-                        16 * 1024 * 1024, // 16 MB cache
+                        128 * 1024, // 128 kB cache
                         fs::OpenOptions::new()
                             .write(true)
                             .create_new(true)
