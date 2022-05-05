@@ -157,7 +157,7 @@ fn main() -> anyhow::Result<()> {
         mqtt_options.set_transport(transport);
     }
 
-    mqtt_options.set_keep_alive(5);
+    mqtt_options.set_keep_alive(Duration::from_secs(5));
     let (mut mqtt_client, mut connection) = Client::new(mqtt_options, 10);
 
     info!(
