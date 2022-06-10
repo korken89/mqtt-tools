@@ -45,15 +45,15 @@ struct Opt {
     #[structopt(short, long, env = "COMPRESSION_LEVEL", default_value = "9")]
     compression_level: i32,
 
-    /// Server address
+    /// Server address for the MQTT broker
     #[structopt(short, long, env = "SERVER", default_value = "localhost")]
     server: String,
 
-    /// Server port
+    /// Server port for the MQTT broker
     #[structopt(short, long, env = "PORT")]
     port: Option<u16>,
 
-    /// TLS enable
+    /// TLS enable for the MQTT connection
     #[structopt(long, env = "TLS")]
     tls: bool,
 
@@ -72,6 +72,18 @@ struct Opt {
     /// Topic to subscribe to. Supports multiple.
     #[structopt(long, env = "TOPIC", default_value = "#")]
     topic: Vec<String>,
+
+    /// Password for the MQTT connection.
+    #[structopt(long, env = "MQTT_PASSWORD")]
+    password: Option<String>,
+
+    /// Client ID for the MQTT connection.
+    #[structopt(long, env = "MQTT_CLIENT_ID")]
+    client_id: Option<String>,
+
+    /// Username for the MQTT connection.
+    #[structopt(long, env = "MQTT_USERNAME")]
+    username: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -159,7 +171,14 @@ fn main() -> anyhow::Result<()> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or(Duration::new(0, 1))
         .subsec_nanos();
-    let mut mqtt_options = MqttOptions::new(&format!("mqtt-logger-sub{}", nanos), &server, port);
+
+    let client_id = if let Some(client_id) = opt.client_id {
+        client_id
+    } else {
+        format!("mqtt-logger-sub{}", nanos)
+    };
+
+    let mut mqtt_options = MqttOptions::new(client_id, &server, port);
 
     // Check for custom CA file
     let custom_ca = if let Some(custom_ca_path) = &opt.custom_ca {
@@ -183,6 +202,11 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Authentication?
+    if let (Some(username), Some(password)) = (opt.username, opt.password) {
+        mqtt_options.set_credentials(username, password);
+    }
+
     // Encrypted MQTT?
     if opt.tls || custom_ca.is_some() {
         let transport = if let Some(custom_ca) = &custom_ca {
@@ -192,10 +216,27 @@ fn main() -> anyhow::Result<()> {
                 client_auth: None,
             })
         } else {
-            let mut client_config = ClientConfig::new();
-            // Use rustls-native-certs to load root certificates from the operating system.
-            client_config.root_store = rustls_native_certs::load_native_certs()
+            use rustls::RootCertStore;
+
+            let root_certs = rustls_native_certs::load_native_certs()
                 .expect("Failed to load platform certificates.");
+
+            let root_certs: Vec<Vec<u8>> = root_certs
+                .into_iter()
+                .map(|certificate| certificate.0)
+                .collect();
+
+            let mut rootcert = RootCertStore::empty();
+            rootcert.add_parsable_certificates(&root_certs);
+
+            let client_config = ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(rootcert)
+                .with_no_client_auth();
+
+            // let mut client_config = ClientConfig::new();
+            // // Use rustls-native-certs to load root certificates from the operating system.
+            // client_config.root_store = rootcert;
 
             Transport::tls_with_config(client_config.into())
         };
@@ -354,13 +395,6 @@ fn main() -> anyhow::Result<()> {
             Err(val) => match val {
                 ConnectionError::MqttState(e) => {
                     debug!("MQTT error, will try to reconnect when possible: {:?}", e);
-                    connected = false;
-                }
-                ConnectionError::Network(e) => {
-                    debug!(
-                        "Network error, will try to reconnect when possible: {:?}",
-                        e
-                    );
                     connected = false;
                 }
                 _ => {
